@@ -670,6 +670,7 @@ function peelToCommit(repo, oid) {
 function collectTreeInto(repo, treeOid, out) {
   const obj = getObject(repo, treeOid);
   if (!obj || obj.type !== 'tree') return;
+  if (!out.has(treeOid)) out.set(treeOid, obj);
   for (const entry of parseTree(obj.data)) {
     if (entry.mode === '160000') continue;
     const child = getObject(repo, entry.oid);
@@ -2672,7 +2673,7 @@ async function handleRequest(req, res) {
       const owner = segments[0];
       const repoName = segments[1].slice(0, -4);
       const tail = segments.slice(2).join('/');
-      if (req.method === 'GET' && tail === 'info/refs') return await handleInfoRefs(req, res, owner, repoName);
+      if (req.method === 'GET' && tail === 'info/refs') return await handleInfoRefs(req, res, owner, repoName, url.searchParams.get('service'));
       if (req.method === 'POST' && tail === 'git-upload-pack') {
         const raw = await readBody(req);
         return await handleUploadPack(req, res, owner, repoName, raw);
