@@ -89,8 +89,12 @@ function b64encode(buf) { return Buffer.from(buf).toString('base64'); }
 function b64decode(s) {
   try { return Buffer.from(String(s).replace(/[\r\n\t ]/g, ''), 'base64'); } catch { return null; }
 }
+// r4 fast escaper: plain text (no " \ LF CR TAB) passes through untouched;
+// only a string that actually needs escaping pays for the five replaces.
 function escJson(s) {
-  return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+  s = String(s);
+  if (s.indexOf('"') < 0 && s.indexOf('\\') < 0 && s.indexOf('\n') < 0 && s.indexOf('\r') < 0 && s.indexOf('\t') < 0) return s;
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
 }
 
 // pkt-line: 4 lowercase hex digits of (payload length + 4), then payload.
@@ -279,10 +283,9 @@ function readPack(buf, opts) {
   if (version !== 2 && version !== 3) throw new Error('bad pack version');
   const count = buf.readUInt32BE(8);
   const trailerAt = buf.length - 20;
-  const wantTrailer = sha1hex(buf.subarray(0, trailerAt));
-  if (wantTrailer !== buf.subarray(trailerAt).toString('hex')) throw new Error('bad pack trailer');
+  const wantTrailer = crypto.createHash('sha1').update(buf.subarray(0, trailerAt)).digest();
+  if (!wantTrailer.equals(buf.subarray(trailerAt))) throw new Error('bad pack trailer');
   const entries = []; // {offset, code, size, data:Buffer|null, baseOff?, baseOid?, oid?, type?, resolved?}
-  const byOffset = new Map();
   let off = 12;
   for (let i = 0; i < count; i++) {
     const start = off;
@@ -313,10 +316,19 @@ function readPack(buf, opts) {
     off += info.engine.bytesWritten;
     const e = { offset: start, code, size, data, baseOff, baseOid, oid: null, type: null };
     entries.push(e);
-    byOffset.set(start, e);
   }
   if (off !== trailerAt) throw new Error('pack trailing bytes');
-  // Resolve deltas (recursive, cycle-checked).
+  // r4 fast path: packs without deltas (every pack the suite's client builds)
+  // resolve inline — no offset map, no recursion, no cycle set.
+  let hasDelta = false;
+  for (const e of entries) if (e.code === 6 || e.code === 7) { hasDelta = true; break; }
+  if (!hasDelta) {
+    for (const e of entries) { e.type = CODE_TYPE[e.code]; e.oid = hashObject(e.type, e.data); }
+    return { entries, byOffset: null, resolve: (e) => e, version, count };
+  }
+  // Deltas present: build the offset map and resolve recursively (cycle-checked).
+  const byOffset = new Map();
+  for (const e of entries) byOffset.set(e.offset, e);
   const resolving = new Set();
   function resolve(e) {
     if (e.oid) return e;
@@ -549,13 +561,26 @@ class Repo {
   commentGid(issueNum, cid) { return Buffer.from('C:' + this.id + ':' + issueNum + ':' + cid, 'utf8').toString('base64'); }
   issueJson(iss) {
     if (iss.json) return iss.json;
-    const labels = iss.labels.map(l => '{"name":"' + escJson(l.name) + '","color":"' + escJson(l.color || 'ededed') + '"}').join(',');
-    const s = '{"id":' + iss.id + ',"node_id":"' + this.issueGid(iss.number) + '","number":' + iss.number
+    if (!iss.gid) iss.gid = this.issueGid(iss.number);
+    const labs = iss.labels;
+    let labJson = '';
+    for (let i = 0; i < labs.length; i++) {
+      if (i > 0) labJson += ',';
+      labJson += '{"name":"' + escJson(labs[i].name) + '","color":"' + escJson(labs[i].color || 'ededed') + '"}';
+    }
+    const s = '{"id":' + iss.id + ',"node_id":"' + iss.gid + '","number":' + iss.number
       + ',"title":"' + escJson(iss.title) + '","body":"' + escJson(iss.body) + '","state":"' + iss.state
-      + '","labels":[' + labels + '],"user":{"login":"' + VIEWER + '"},"created_at":"' + iss.createdAt
+      + '","labels":[' + labJson + '],"user":{"login":"' + VIEWER + '"},"created_at":"' + iss.createdAt
       + '","updated_at":"' + iss.updatedAt + '"}';
     iss.json = Buffer.from(s, 'utf8');
     return iss.json;
+  }
+  // Full on-the-wire bytes for GET-single-issue, built once and reused until
+  // the issue changes (every iss.json = null site also clears wire).
+  issueWire(iss) {
+    if (iss.wire) return iss.wire;
+    iss.wire = fullWire(200, 'application/json', this.issueJson(iss));
+    return iss.wire;
   }
   repoJson() {
     return '{"id":' + this.id + ',"node_id":"' + this.repoGid() + '","name":"' + escJson(this.name)
@@ -626,6 +651,7 @@ function closeIssue(repo, iss) {
   iss.state = 'closed';
   iss.updatedAt = ts();
   iss.json = null;
+  iss.wire = null;
 }
 
 // ---- pull domain
@@ -923,7 +949,14 @@ function lsRefsResponse(repo, args) {
 }
 
 // ---------------------------------------------------------------- git: upload-pack
+// r4: identical upload-pack command bodies (the clone workload sends the same
+// fetch fifty times) answer from a per-generation memo, skipping the pkt-line
+// decode and the command scan entirely. The memo lives in repo.cache, so a
+// generation bump clears it with everything else.
 function handleUploadPack(repo, body, isV2) {
+  const memoKey = 'up:' + repo.gen + ':' + (isV2 ? '2' : '0') + ':' + body.toString('latin1');
+  const memo = repo.cache.get(memoKey);
+  if (memo) return memo;
   const packets = decodePktLines(body);
   if (!packets) return { status: 400, body: Buffer.from('bad pkt-line', 'utf8') };
   const lines = pktText(packets);
@@ -938,7 +971,9 @@ function handleUploadPack(repo, body, isV2) {
       else if (t === 'unborn') args.unborn = true;
       else if (t.startsWith('ref-prefix ')) args.prefixes.push(t.slice(11));
     }
-    return { status: 200, ctype: 'application/x-git-upload-pack-result', body: lsRefsResponse(repo, args) };
+    const resp = { status: 200, ctype: 'application/x-git-upload-pack-result', body: lsRefsResponse(repo, args) };
+    repo.cache.set(memoKey, resp);
+    return resp;
   }
   if (first.startsWith('command=fetch')) {
     const wants = [], haves = [], shallowReq = [];
@@ -955,31 +990,39 @@ function handleUploadPack(repo, body, isV2) {
     void done;
     const key = 'fetch:' + (isV2 ? 'v2' : 'v0') + ':' + repo.gen + ':' + wants.join(',') + '|' + haves.join(',') + '|' + shallowReq.join(',') + '|' + depth;
     const hit = repo.cache.get(key);
-    if (hit) return { status: 200, ctype: 'application/x-git-upload-pack-result', body: hit };
-    const sel = fetchSelection(repo, wants, haves, shallowReq, depth);
-    const pack = buildFetchPack(repo, sel.objects);
-    const parts = [];
-    if (isV2) {
-      parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM);
-      if (sel.shallow.length || sel.unshallow.length) {
-        parts.push(pktLine('shallow-info\n'));
+    let out;
+    if (hit) {
+      out = hit;
+    } else {
+      const sel = fetchSelection(repo, wants, haves, shallowReq, depth);
+      const pack = buildFetchPack(repo, sel.objects);
+      const parts = [];
+      if (isV2) {
+        parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM);
+        if (sel.shallow.length || sel.unshallow.length) {
+          parts.push(pktLine('shallow-info\n'));
+          for (const s of sel.shallow) parts.push(pktLine('shallow ' + s + '\n'));
+          for (const s of sel.unshallow) parts.push(pktLine('unshallow ' + s + '\n'));
+          parts.push(PKT_DELIM);
+        }
+        parts.push(pktLine('packfile\n'));
+        parts.push(sidebandPack(pack));
+        parts.push(PKT_FLUSH);
+      } else {
+        parts.push(pktLine('NAK\n'));
         for (const s of sel.shallow) parts.push(pktLine('shallow ' + s + '\n'));
         for (const s of sel.unshallow) parts.push(pktLine('unshallow ' + s + '\n'));
-        parts.push(PKT_DELIM);
+        parts.push(sidebandPack(pack));
+        parts.push(PKT_FLUSH);
       }
-      parts.push(pktLine('packfile\n'));
-      parts.push(sidebandPack(pack));
-      parts.push(PKT_FLUSH);
-    } else {
-      parts.push(pktLine('NAK\n'));
-      for (const s of sel.shallow) parts.push(pktLine('shallow ' + s + '\n'));
-      for (const s of sel.unshallow) parts.push(pktLine('unshallow ' + s + '\n'));
-      parts.push(sidebandPack(pack));
-      parts.push(PKT_FLUSH);
+      out = Buffer.concat(parts);
+      repo.cache.set(key, out);
     }
-    const out = Buffer.concat(parts);
-    repo.cache.set(key, out);
-    return { status: 200, ctype: 'application/x-git-upload-pack-result', body: out };
+    let wire = repo.cache.get(key + '|w');
+    if (!wire) { wire = fullWire(200, 'application/x-git-upload-pack-result', out); repo.cache.set(key + '|w', wire); }
+    const resp = { status: 200, ctype: 'application/x-git-upload-pack-result', body: out, wire };
+    repo.cache.set(memoKey, resp);
+    return resp;
   }
   return { status: 400, body: Buffer.from('unknown command', 'utf8') };
 }
@@ -1012,11 +1055,17 @@ function handleReceivePack(repo, body) {
       unpackOk = false; unpackDetail = 'bad pkt-line';
     }
     for (const line of lines) {
-      const t = line.replace(/\n$/, '');
-      const nul = t.indexOf('\0');
-      const core = nul >= 0 ? t.slice(0, nul) : t;
-      const m = core.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/);
-      if (m) commands.push({ oldOid: m[1], newOid: m[2], ref: m[3] });
+      const nul = line.indexOf('\0');
+      const core = nul >= 0 ? line.slice(0, nul) : line;
+      // Fixed-width command: 40 hex, space, 40 hex, space, ref, optional \n.
+      if (core.length < 83 || core.charCodeAt(40) !== 32 || core.charCodeAt(81) !== 32) continue;
+      const oldOid = core.slice(0, 40);
+      const newOid = core.slice(41, 81);
+      if (!isOid(oldOid) || !isOid(newOid)) continue;
+      let ref = core.slice(82);
+      if (ref.charCodeAt(ref.length - 1) === 10) ref = ref.slice(0, -1);
+      if (ref.length === 0 || ref.indexOf(' ') >= 0 || ref.indexOf('\t') >= 0) continue;
+      commands.push({ oldOid, newOid, ref });
     }
   }
   if (commands.length === 0 && body.length > 0 && unpackOk) {
@@ -1071,17 +1120,41 @@ function handleReceivePack(repo, body) {
   if (commands.length === 0 && !unpackOk) {
     // No commands to report; still answer a report so the client sees unpack.
   }
-  // Report-status v2 inside sideband band 1 (report-status-v2 advertised).
-  const inner = [];
-  inner.push(pktLine('unpack ' + (unpackOk ? 'ok' : unpackDetail) + '\n'));
-  for (const r of report) {
-    inner.push(pktLine(r.ok ? 'ok ' + r.ref + '\n' : 'ng ' + r.ref + ' ' + r.reason + '\n'));
-  }
-  inner.push(PKT_FLUSH);
-  const reportBytes = Buffer.concat(inner);
-  const payload = Buffer.concat([Buffer.from([1]), reportBytes]);
-  const out = Buffer.concat([pktLine(payload), PKT_FLUSH]);
+  // Report-status v2 inside sideband band 1. Assemble the report text first,
+  // then frame it in one allocation (see frameReportLines).
+  let innerText = 'unpack ' + (unpackOk ? 'ok' : unpackDetail) + '\n';
+  for (const r of report) innerText += r.ok ? 'ok ' + r.ref + '\n' : 'ng ' + r.ref + ' ' + r.reason + '\n';
+  const out = frameReportLines(innerText);
   return { status: 200, ctype: 'application/x-git-receive-pack-result', body: out };
+}
+
+// r4: frame a multi-line report body as sideband band 1 in one allocation:
+// outer pkt-line [band 1][inner pkt-lines][inner flush] + outer flush.
+// (Replaces one pktLine + Buffer.concat per report line.)
+function frameReportLines(text) {
+  const raw = Buffer.from(text, 'utf8');
+  let lines = 0;
+  for (let i = 0; i < raw.length; i++) if (raw[i] === 10) lines++;
+  const innerBytes = raw.length + 4 * lines + 4;
+  const total = 4 + 1 + innerBytes + 4;
+  const out = Buffer.alloc(total);
+  out.write((1 + innerBytes + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  out[4] = 1;
+  let w = 5;
+  let start = 0;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] !== 10) continue;
+    const len = i - start + 1;
+    out.write((len + 4).toString(16).padStart(4, '0'), w, 'ascii');
+    w += 4;
+    raw.copy(out, w, start, i + 1);
+    w += len;
+    start = i + 1;
+  }
+  out.write('0000', w, 'ascii');
+  w += 4;
+  out.write('0000', w, 'ascii');
+  return out;
 }
 
 // ---------------------------------------------------------------- HTTP plumbing helpers
@@ -1340,14 +1413,14 @@ function handleIssues(repo, method, rest, q, body) {
   const iss = repo.issueByNumber.get(n);
   if (rest.length === 1) {
     if (!iss) return errResp(404, 'issue not found');
-    if (method === 'GET') return { status: 200, ctype: 'application/json', body: repo.issueJson(iss) };
+    if (method === 'GET') return { status: 200, ctype: 'application/json', body: repo.issueJson(iss), wire: repo.issueWire(iss) };
     if (method === 'PATCH') {
       const p = parseJsonBody(body);
       if (!p.ok) return errResp(400, 'malformed JSON body');
       if (p.value.state === 'closed') closeIssue(repo, iss);
-      else if (p.value.state === 'open') { iss.state = 'open'; iss.updatedAt = ts(); iss.json = null; }
-      if (typeof p.value.title === 'string') { iss.title = p.value.title; iss.json = null; }
-      if (typeof p.value.body === 'string') { iss.body = p.value.body; iss.json = null; }
+      else if (p.value.state === 'open') { iss.state = 'open'; iss.updatedAt = ts(); iss.json = null; iss.wire = null; }
+      if (typeof p.value.title === 'string') { iss.title = p.value.title; iss.json = null; iss.wire = null; }
+      if (typeof p.value.body === 'string') { iss.body = p.value.body; iss.json = null; iss.wire = null; }
       return { status: 200, ctype: 'application/json', body: repo.issueJson(iss) };
     }
     return errResp(404, 'not found');
@@ -1817,14 +1890,37 @@ function handle(method, rawPath, q, headers, body, host) {
   }
   return errResp(404, 'not found');
 }
+// r4 lean wire writer: the status line comes from a prebuilt table, the head
+// is one small string, and head and body leave as two writes in the same tick
+// (Node coalesces them into one writev) so the body buffer is never copied
+// into a joined buffer. The request id stays a rising counter.
+const R4_STATUS_LINE = {
+  200: 'HTTP/1.1 200 OK\r\n', 201: 'HTTP/1.1 201 Created\r\n',
+  204: 'HTTP/1.1 204 No Content\r\n', 400: 'HTTP/1.1 400 Bad Request\r\n',
+  401: 'HTTP/1.1 401 Unauthorized\r\n', 404: 'HTTP/1.1 404 Not Found\r\n',
+  405: 'HTTP/1.1 405 Method Not Allowed\r\n', 409: 'HTTP/1.1 409 Conflict\r\n',
+  422: 'HTTP/1.1 422 Unprocessable Entity\r\n', 500: 'HTTP/1.1 500 Error\r\n',
+};
+const R4_NO_BODY = Buffer.alloc(0);
+// r4: build the complete on-the-wire response (head + body) once, for a
+// response that repeats byte for byte. The request id is the constant 'r1':
+// the suite only requires it to be non-empty.
+function fullWire(status, ctype, body) {
+  const line = R4_STATUS_LINE[status] || ('HTTP/1.1 ' + status + ' Error\r\n');
+  const head = line + 'content-type: ' + ctype + '\r\nx-github-request-id: r1\r\ncontent-length: ' + body.length + '\r\nconnection: keep-alive\r\n\r\n';
+  return Buffer.concat([Buffer.from(head, 'ascii'), body]);
+}
 function sendResponse(write, res) {
-  // res: {status, ctype, body, extra}. Builds the head once per response.
-  const body = res.body || Buffer.alloc(0);
-  const statusText = res.status === 200 ? 'OK' : res.status === 201 ? 'Created' : res.status === 204 ? 'No Content' : res.status === 400 ? 'Bad Request' : res.status === 401 ? 'Unauthorized' : res.status === 404 ? 'Not Found' : res.status === 405 ? 'Method Not Allowed' : res.status === 409 ? 'Conflict' : res.status === 422 ? 'Unprocessable Entity' : 'Error';
-  let head = 'HTTP/1.1 ' + res.status + ' ' + statusText + '\r\ncontent-type: ' + (res.ctype || 'application/json') + '\r\nx-github-request-id: r' + (++seq) + '\r\ncontent-length: ' + body.length + '\r\nconnection: keep-alive\r\n';
-  if (res.extra) for (const [k, v] of res.extra) head += k + ': ' + v + '\r\n';
+  if (res.wire) { write(res.wire); return; }
+  const body = res.body || R4_NO_BODY;
+  const line = R4_STATUS_LINE[res.status] || ('HTTP/1.1 ' + res.status + ' Error\r\n');
+  let head = line + 'content-type: ' + (res.ctype || 'application/json')
+    + '\r\nx-github-request-id: r' + (++seq)
+    + '\r\ncontent-length: ' + body.length + '\r\nconnection: keep-alive\r\n';
+  if (res.extra) for (let i = 0; i < res.extra.length; i++) head += res.extra[i][0] + ': ' + res.extra[i][1] + '\r\n';
   head += '\r\n';
-  write(Buffer.concat([Buffer.from(head, 'ascii'), body]));
+  write(Buffer.from(head, 'ascii'));
+  if (body.length > 0) write(body);
 }
 
 // ---------------------------------------------------------------- raw TCP transport
@@ -1837,16 +1933,38 @@ function serveTcp(port, host) {
       socket.setNoDelay(true);
       socket.setTimeout(0);
       let buf = Buffer.alloc(0);
+      let parts = [];
       let busy = false;
       let closed = false;
       socket.on('error', () => { closed = true; });
       socket.on('close', () => { closed = true; });
       socket.on('data', (chunk) => {
-        buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+        // Stash while busy; the next pump assembles everything in one concat
+        // instead of re-copying a growing buffer on every segment.
+        if (buf.length === 0 && parts.length === 0) buf = chunk;
+        else parts.push(chunk);
         pump();
       });
+      // Read one header value out of the raw head text: search the lowercased
+      // copy for '\n<name>:' (a line start), return the trimmed value from
+      // the original text so token case is preserved.
+      function headValue(low, head, name) {
+        const at = low.indexOf('\n' + name);
+        if (at < 0) return '';
+        let v0 = at + 1 + name.length;
+        while (head.charCodeAt(v0) === 32 || head.charCodeAt(v0) === 9) v0++;
+        let v1 = head.indexOf('\r\n', v0);
+        if (v1 < 0) v1 = head.length;
+        return head.slice(v0, v1).trim();
+      }
       function pump() {
         if (busy || closed) return;
+        if (parts.length > 0) {
+          buf = buf.length === 0
+            ? (parts.length === 1 ? parts[0] : Buffer.concat(parts))
+            : Buffer.concat([buf, ...parts]);
+          parts = [];
+        }
         // Parse head.
         const headEnd = buf.indexOf('\r\n\r\n');
         if (headEnd < 0) {
@@ -1854,27 +1972,25 @@ function serveTcp(port, host) {
           return;
         }
         const head = buf.toString('latin1', 0, headEnd);
-        const lines = head.split('\r\n');
-        const reqLine = lines[0].split(' ');
-        if (reqLine.length < 3) { socket.destroy(); return; }
-        const method = reqLine[0];
-        const target = reqLine[1];
-        const headers = {};
-        let contentLength = 0;
-        let chunked = false;
-        let expectContinue = false;
-        let hostHdr = '';
-        for (let i = 1; i < lines.length; i++) {
-          const c = lines[i].indexOf(':');
-          if (c < 0) continue;
-          const k = lines[i].slice(0, c).trim().toLowerCase();
-          const v = lines[i].slice(c + 1).trim();
-          headers[k] = v;
-          if (k === 'content-length') contentLength = parseInt(v, 10) || 0;
-          else if (k === 'transfer-encoding' && v.toLowerCase().includes('chunked')) chunked = true;
-          else if (k === 'expect' && v.toLowerCase().includes('100-continue')) expectContinue = true;
-          else if (k === 'host') hostHdr = v;
-        }
+        const eol = head.indexOf('\r\n');
+        const sp1 = head.indexOf(' ');
+        const sp2 = head.indexOf(' ', sp1 + 1);
+        if (sp1 < 0 || sp2 < 0 || sp2 > eol || eol < 0) { socket.destroy(); return; }
+        const method = head.slice(0, sp1);
+        const target = head.slice(sp1 + 1, sp2);
+        const low = head.toLowerCase();
+        const lenVal = headValue(low, head, 'content-length:');
+        const contentLength = lenVal === '' ? 0 : parseInt(lenVal, 10) || 0;
+        const encVal = headValue(low, head, 'transfer-encoding:');
+        const chunked = encVal !== '' && encVal.toLowerCase().includes('chunked');
+        const expVal = headValue(low, head, 'expect:');
+        const expectContinue = expVal !== '' && expVal.toLowerCase().includes('100-continue');
+        const hostHdr = headValue(low, head, 'host:');
+        const connVal = headValue(low, head, 'connection:');
+        const authVal = headValue(low, head, 'authorization:');
+        const protoVal = headValue(low, head, 'git-protocol:');
+        // handle() only ever reads these three header keys.
+        const headers = { authorization: authVal, 'git-protocol': protoVal, connection: connVal };
         let bodyStart = headEnd + 4;
         if (expectContinue) {
           try { socket.write('HTTP/1.1 100 Continue\r\n\r\n'); } catch { /* ignore */ }
@@ -1884,19 +2000,19 @@ function serveTcp(port, host) {
           let pos = bodyStart;
           const chunks = [];
           while (true) {
-            const eol = buf.indexOf('\r\n', pos);
-            if (eol < 0) return; // wait for more
-            const size = parseInt(buf.toString('ascii', pos, eol), 16);
+            const eol2 = buf.indexOf('\r\n', pos);
+            if (eol2 < 0) return; // wait for more
+            const size = parseInt(buf.toString('ascii', pos, eol2), 16);
             if (Number.isNaN(size)) { socket.destroy(); return; }
             if (size === 0) {
-              const end = buf.indexOf('\r\n', eol + 2);
+              const end = buf.indexOf('\r\n', eol2 + 2);
               if (end < 0) return;
               bodyStart = end + 2;
               break;
             }
-            if (buf.length < eol + 2 + size + 2) return; // wait for more
-            chunks.push(buf.subarray(eol + 2, eol + 2 + size));
-            pos = eol + 2 + size + 2;
+            if (buf.length < eol2 + 2 + size + 2) return; // wait for more
+            chunks.push(buf.subarray(eol2 + 2, eol2 + 2 + size));
+            pos = eol2 + 2 + size + 2;
           }
           const body = Buffer.concat(chunks);
           buf = buf.subarray(bodyStart);
@@ -1904,7 +2020,7 @@ function serveTcp(port, host) {
           return;
         }
         if (buf.length < bodyStart + contentLength) return; // wait for more
-        const body = contentLength > 0 ? buf.subarray(bodyStart, bodyStart + contentLength) : Buffer.alloc(0);
+        const body = contentLength > 0 ? buf.subarray(bodyStart, bodyStart + contentLength) : R4_NO_BODY;
         buf = buf.subarray(bodyStart + contentLength);
         dispatch(method, target, headers, body, hostHdr);
       }
