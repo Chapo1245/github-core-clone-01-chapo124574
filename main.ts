@@ -309,8 +309,16 @@ function readPack(pack) {
     } else if (!PACK_TYPE[typeCode]) {
       throw new Error(`pack type ${typeCode}`);
     }
-    const end = findZlibEnd(buf, off, entry.size, trailerStart);
-    const inflated = inflateSync(buf.subarray(off, end));
+    let inflated;
+    let end;
+    if (INFLATE_END_OK) {
+      const r = inflateAt(buf, off, trailerStart);
+      inflated = r.data;
+      end = r.end;
+    } else {
+      end = findZlibEnd(buf, off, entry.size, trailerStart);
+      inflated = inflateSync(buf.subarray(off, end));
+    }
     if (inflated.length !== entry.size) throw new Error('pack entry size mismatch');
     entry.data = inflated;
     off = end;
@@ -363,6 +371,9 @@ function readPack(pack) {
  * Node's inflateSync ignores trailing bytes and throws on truncation, so the exact
  * end is the smallest prefix that inflates cleanly; binary-search it inside a tight
  * bound (a deflated stream is never much larger than its inflated size).
+ * Kept as the fallback when the running Node does not report the consumed input
+ * length (see INFLATE_END_OK / inflateAt): every failed probe throws an Error and
+ * pays for a full stack trace, so this is several times slower than inflateAt.
  */
 function findZlibEnd(buf, off, inflatedSize, limit) {
   const hiBound = Math.min(limit, off + inflatedSize + Math.floor(inflatedSize / 500) + 64);
@@ -383,6 +394,39 @@ function findZlibEnd(buf, off, inflatedSize, limit) {
     else lo = mid;
   }
   return hi;
+}
+
+/**
+ * Whether this Node reports the consumed input length of a one-shot inflate:
+ * inflateSync(buf, {info:true}) returns {buffer, engine} and engine.bytesWritten
+ * is the number of input bytes the zlib stream consumed (verified below). When
+ * true, inflateAt finds a stream's end in a single call with no throwing probes.
+ */
+const INFLATE_END_OK = (() => {
+  try {
+    const probe = Buffer.from('inflate-end probe '.repeat(64), 'utf8');
+    const deflated = deflateSync(probe);
+    const joined = Buffer.concat([deflated, deflateSync(Buffer.from('second'))]);
+    const res = inflateSync(joined, { info: true });
+    return res.buffer.length === probe.length && res.engine.bytesWritten === deflated.length;
+  } catch {
+    return false;
+  }
+})();
+
+/**
+ * Inflate the zlib stream starting at `off` (and no further than `limit`) in one
+ * call, returning the inflated bytes and the offset just past the stream. Uses the
+ * engine's consumed-input count, so there is no probing and no thrown error on the
+ * hot path; a truncated or corrupt stream still throws, as before.
+ */
+function inflateAt(buf, off, limit) {
+  const res = inflateSync(buf.subarray(off, limit), { info: true });
+  const consumed = res.engine.bytesWritten;
+  if (!Number.isFinite(consumed) || consumed <= 0 || off + consumed > limit) {
+    throw new Error('zlib stream does not complete');
+  }
+  return { data: res.buffer, end: off + consumed };
 }
 
 function writePackObjectHeader(type, size) {
@@ -433,6 +477,7 @@ const store = {
 };
 
 function newRepo(owner, name, opts) {
+  const createdSeq = ++store.tsSeq;
   return {
     owner,
     name,
@@ -440,15 +485,38 @@ function newRepo(owner, name, opts) {
     private: opts.private ?? false,
     defaultBranch: DEFAULT_BRANCH,
     databaseId: store.nextDbId++,
-    createdSeq: ++store.tsSeq,
+    createdSeq,
+    nodeId: gid('Repository', `${owner}/${name}`),
+    createdAt: isoTs(createdSeq),
+    updatedAt: isoTs(createdSeq),
     objects: new Map(), // oid -> {type, data}
     refs: new Map(), // refname -> oid
     issues: new Map(), // number -> issue
     nextIssueNumber: 1,
+    issueJson: new Map(), // number -> serialized GET-single-issue response (dropped on mutation)
     pulls: new Map(), // number -> pull
     nextPullNumber: 1,
     labels: new Map(), // name -> {name, color}
+    gen: 0, // git generation: bumped on any refs/objects change; part of git-cache keys
+    gitCache: new Map(), // cached git responses (advertisement, ls-refs, fetch pack), keyed with gen
   };
+}
+
+/** Drop a repo's cached GET-single-issue response after the issue changed. */
+function dropIssueJson(repo, number) {
+  repo.issueJson.delete(number);
+}
+
+/** Bump the repo's git generation and drop cached git responses. Call after any change to refs or objects. */
+function bumpGitGen(repo) {
+  repo.gen++;
+  repo.gitCache.clear();
+}
+
+/** Store a git response in the repo cache, bounding the map. */
+function gitCacheSet(repo, key, buf) {
+  if (repo.gitCache.size > 512) repo.gitCache.clear();
+  repo.gitCache.set(key, buf);
 }
 
 function repoKey(owner, name) {
@@ -481,7 +549,7 @@ function deleteRepoInternal(owner, name) {
 function repoRestObject(repo) {
   return {
     id: repo.databaseId,
-    node_id: gid('Repository', `${repo.owner}/${repo.name}`),
+    node_id: repo.nodeId ?? gid('Repository', `${repo.owner}/${repo.name}`),
     name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
     owner: { login: repo.owner, id: VIEWER_ID, type: 'User' },
@@ -490,8 +558,8 @@ function repoRestObject(repo) {
     default_branch: repo.defaultBranch,
     html_url: `https://github.com/${repo.owner}/${repo.name}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}`,
-    created_at: isoTs(repo.createdSeq),
-    updated_at: isoTs(repo.createdSeq),
+    created_at: repo.createdAt ?? isoTs(repo.createdSeq),
+    updated_at: repo.updatedAt ?? isoTs(repo.createdSeq),
     has_issues: true,
     has_projects: false,
     has_wiki: false,
@@ -569,6 +637,7 @@ function commitOnBranch(repo, branch, changes, message) {
   const commitData = buildCommit({ tree: treeOid, parents: parent ? [parent] : [], author: ident, committer: ident, timestamp: ts, message });
   const oid = putObject(repo, 'commit', commitData);
   repo.refs.set(refName, oid);
+  bumpGitGen(repo);
   return oid;
 }
 
@@ -725,7 +794,7 @@ function fetchSelection(repo, { wants, haves, shallow, depth }) {
   }
   const shallowOut = wantRes.shallow;
   const unshallowOut = (shallow ?? []).filter((oid) => wantRes.objects.has(oid) && !shallowOut.includes(oid));
-  return { objects: send, shallow: shallowOut, unshallow: unshallowOut };
+  return { objects: send, shallow: shallowOut, unshallow: unshallowOut, wantObjects: wantRes.objects };
 }
 
 // ---------------------------------------------------------------------------
@@ -735,15 +804,15 @@ function fetchSelection(repo, { wants, haves, shallow, depth }) {
 function issueRestObject(repo, issue) {
   return {
     id: issue.id,
-    node_id: gid('Issue', `${repo.owner}/${repo.name}:${issue.number}`),
+    node_id: issue.nodeId ?? gid('Issue', `${repo.owner}/${repo.name}:${issue.number}`),
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
     labels: issue.labels.map((name) => labelRestObject(repo, name)),
     user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-    created_at: isoTs(issue.seq),
-    updated_at: isoTs(issue.seq),
+    created_at: issue.createdAt ?? isoTs(issue.seq),
+    updated_at: issue.updatedAt ?? isoTs(issue.seq),
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
     comments: issue.comments.length,
@@ -762,6 +831,7 @@ function createIssueInternal(repo, { title, body, labels }) {
     if (!repo.labels.has(name)) return { error: `unknown label ${name}`, status: 422 };
   }
   const number = repo.nextIssueNumber++;
+  const seq = ++store.tsSeq;
   const issue = {
     id: store.nextRestId++,
     number,
@@ -769,7 +839,10 @@ function createIssueInternal(repo, { title, body, labels }) {
     body: body ?? '',
     state: 'open',
     labels: [...wanted],
-    seq: ++store.tsSeq,
+    seq,
+    nodeId: gid('Issue', `${repo.owner}/${repo.name}:${number}`),
+    createdAt: isoTs(seq),
+    updatedAt: isoTs(seq),
     comments: [],
   };
   repo.issues.set(number, issue);
@@ -781,7 +854,7 @@ function pullRestObject(repo, pull) {
   const baseSha = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha ?? ZERO_OID;
   return {
     id: pull.id,
-    node_id: gid('PullRequest', `${repo.owner}/${repo.name}:${pull.number}`),
+    node_id: pull.nodeId ?? gid('PullRequest', `${repo.owner}/${repo.name}:${pull.number}`),
     number: pull.number,
     title: pull.title,
     body: pull.body,
@@ -792,8 +865,8 @@ function pullRestObject(repo, pull) {
     head: { ref: pull.headRef, sha: headSha, label: `${repo.owner}:${pull.headRef}` },
     base: { ref: pull.baseRef, sha: baseSha, label: `${repo.owner}:${pull.baseRef}` },
     user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-    created_at: isoTs(pull.seq),
-    updated_at: isoTs(pull.seq),
+    created_at: pull.createdAt ?? isoTs(pull.seq),
+    updated_at: pull.updatedAt ?? isoTs(pull.seq),
     html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}`,
   };
@@ -811,6 +884,7 @@ function createPullInternal(repo, { title, head, base, body }) {
     }
   }
   const number = repo.nextPullNumber++;
+  const seq = ++store.tsSeq;
   const pull = {
     id: store.nextRestId++,
     number,
@@ -824,7 +898,10 @@ function createPullInternal(repo, { title, head, base, body }) {
     baseRef: base,
     headSha: headTip,
     baseSha: baseTip,
-    seq: ++store.tsSeq,
+    seq,
+    nodeId: gid('PullRequest', `${repo.owner}/${repo.name}:${number}`),
+    createdAt: isoTs(seq),
+    updatedAt: isoTs(seq),
   };
   repo.pulls.set(number, pull);
   return { pull };
@@ -922,6 +999,7 @@ function mergePullInternal(repo, pull) {
   const commitData = buildCommit({ tree: treeOid, parents: [baseTip], author: ident, committer: ident, timestamp: ts, message });
   const sha = putObject(repo, 'commit', commitData);
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+  bumpGitGen(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = isoTs(++store.tsSeq);
@@ -942,6 +1020,24 @@ function readBody(req) {
   });
 }
 
+/** Shared empty body for requests that never carry one (GET/HEAD): avoids awaiting 'end'. */
+const EMPTY_BODY = Buffer.alloc(0);
+/** Shared empty query params for URLs without a query string. */
+const EMPTY_PARAMS = new URLSearchParams();
+
+/**
+ * Split a request URL into pathname + query without `new URL` (which costs a
+ * full parse per request) and without decoding segments that contain no '%'
+ * (decodeURIComponent of such a segment is the identity). Behaviour matches
+ * `new URL(raw, base)` for the origin-form URLs this server receives.
+ */
+function parseRequestUrl(raw) {
+  const q = raw.indexOf('?');
+  const pathname = q >= 0 ? raw.slice(0, q) : raw;
+  const searchParams = q >= 0 ? new URLSearchParams(raw.slice(q + 1)) : EMPTY_PARAMS;
+  return { pathname, searchParams };
+}
+
 function requestId() {
   return `req-${++store.reqSeq}`;
 }
@@ -956,6 +1052,17 @@ function sendJson(res, status, obj, extra = {}) {
     ...extra,
   });
   res.end(body);
+}
+
+/** Send a pre-serialized JSON body with exactly sendJson's headers (for cached responses). */
+function sendCachedJson(res, status, buf) {
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': buf.length,
+    'x-github-request-id': requestId(),
+    'x-oauth-scopes': 'repo, read:org',
+  });
+  res.end(buf);
 }
 
 function sendRaw(res, status, body, contentType, extra = {}) {
@@ -1062,7 +1169,11 @@ function handleInfoRefs(req, res, owner, repoName, service) {
   if (!repo) return jsonError(res, 404, 'Not Found');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return jsonError(res, 400, 'unknown service');
   const wantV2 = service === 'git-upload-pack' && req.headers['git-protocol'] === 'version=2';
+  const key = `adv|${repo.gen}|${service}|${wantV2 ? '2' : '0'}`;
+  const cached = repo.gitCache.get(key);
+  if (cached) return sendRaw(res, 200, cached, `application/x-${service}-advertisement`);
   const body = advertisementBuffer(repo, service, wantV2);
+  gitCacheSet(repo, key, body);
   sendRaw(res, 200, body, `application/x-${service}-advertisement`);
 }
 
@@ -1114,7 +1225,11 @@ function handleUploadPack(req, res, owner, repoName, body) {
       else if (t === 'symrefs') symrefs = true;
       else if (t.startsWith('ref-prefix ')) prefixes.push(t.slice('ref-prefix '.length));
     }
+    const key = `ls|${repo.gen}|${prefixes.join(',')}|${peel ? 'p' : ''}${symrefs ? 's' : ''}`;
+    const cached = repo.gitCache.get(key);
+    if (cached) return sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
     const out = lsRefsResponse(repo, { prefixes, peel, symrefs });
+    gitCacheSet(repo, key, out);
     return sendRaw(res, 200, out, 'application/x-git-upload-pack-result');
   }
   if (first === 'command=fetch') return handleFetchV2(repo, res, textLines);
@@ -1150,11 +1265,13 @@ function handleFetchV2(repo, res, textLines) {
     const out = Buffer.concat([encodePktLines(['acknowledgments\n', 'NAK\n', 'delim', 'packfile\n']), ...sidebandPackets(writePack([])), PKT_FLUSH]);
     return sendRaw(res, 200, out, 'application/x-git-upload-pack-result');
   }
+  const key = `f2|${repo.gen}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth}|${args.filter ?? ''}`;
+  const cached = repo.gitCache.get(key);
+  if (cached) return sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
   const sel = fetchSelection(repo, { wants: args.wants, haves: args.haves, shallow: args.shallow, depth: args.depth });
-  const wantRes = reachableObjects(repo, args.wants, { depth: args.depth });
   const pack = writePack([...sel.objects.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([, o]) => o));
   const parts = [];
-  parts.push(encodePktLines(['acknowledgments\n', ...ackLinesFor(repo, args, wantRes.objects), 'delim']));
+  parts.push(encodePktLines(['acknowledgments\n', ...ackLinesFor(repo, args, sel.wantObjects), 'delim']));
   if (sel.shallow.length > 0 || sel.unshallow.length > 0) {
     const lines = ['shallow-info\n'];
     for (const oid of sel.shallow) lines.push(`shallow ${oid}\n`);
@@ -1165,7 +1282,9 @@ function handleFetchV2(repo, res, textLines) {
   parts.push(encodePktLines(['packfile\n']));
   parts.push(Buffer.concat(sidebandPackets(pack)));
   parts.push(PKT_FLUSH);
-  sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const out = Buffer.concat(parts);
+  gitCacheSet(repo, key, out);
+  sendRaw(res, 200, out, 'application/x-git-upload-pack-result');
 }
 
 function handleFetchV0(repo, res, textLines) {
@@ -1179,13 +1298,17 @@ function handleFetchV0(repo, res, textLines) {
     else if (t.startsWith('shallow ')) args.shallow.push(t.slice(8).trim());
     else if (t.startsWith('deepen ')) args.depth = Number.parseInt(t.slice(7), 10);
   }
+  const key = `f0|${repo.gen}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth}`;
+  const cached = repo.gitCache.get(key);
+  if (cached) return sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
   const sel = fetchSelection(repo, { wants: args.wants, haves: args.haves, shallow: args.shallow, depth: args.depth });
-  const wantRes = reachableObjects(repo, args.wants, { depth: args.depth });
   const pack = writePack([...sel.objects.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([, o]) => o));
-  const lines = [...ackLinesFor(repo, args, wantRes.objects)];
+  const lines = [...ackLinesFor(repo, args, sel.wantObjects)];
   for (const oid of sel.shallow) lines.push(`shallow ${oid}\n`);
   const head = encodePktLines(lines);
-  sendRaw(res, 200, Buffer.concat([head, ...sidebandPackets(pack), PKT_FLUSH]), 'application/x-git-upload-pack-result');
+  const out = Buffer.concat([head, ...sidebandPackets(pack), PKT_FLUSH]);
+  gitCacheSet(repo, key, out);
+  sendRaw(res, 200, out, 'application/x-git-upload-pack-result');
 }
 
 function handleReceivePack(req, res, owner, repoName, body) {
@@ -1268,6 +1391,7 @@ function handleReceivePack(req, res, owner, repoName, body) {
   } else {
     for (const cmd of parsed) report.push({ ref: cmd.ref, ok: false, reason: unpackDetail });
   }
+  if (unpackOk) bumpGitGen(repo); // objects and/or refs may have changed; cached git responses are stale
   const lines = [`unpack ${unpackDetail}\n`];
   for (const r of report) lines.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`);
   const reportBytes = encodePktLines(lines);
@@ -1416,6 +1540,7 @@ function handleRepoRest(req, res, repo, rest, query, body, method) {
       if (typeof sha !== 'string' || !repo.objects.has(sha)) return jsonError(res, 422, 'unknown object');
       if (repo.refs.has(ref)) return jsonError(res, 422, 'reference already exists');
       repo.refs.set(ref, sha);
+      bumpGitGen(repo);
       return sendJson(res, 201, { ref, object: { sha, type: getObject(repo, sha).type } });
     }
     if (method === 'GET' && rest.length === 2) {
@@ -1528,6 +1653,7 @@ function handleContents(req, res, repo, pathParts, query, body, method) {
       const defaultTip = headTip(repo);
       if (defaultTip) {
         repo.refs.set(`refs/heads/${branch}`, defaultTip);
+        bumpGitGen(repo);
         branchTip = defaultTip;
       } else {
         // Unborn repository: this branch becomes the first (and default) branch.
@@ -1621,7 +1747,13 @@ function handleIssues(req, res, repo, rest, query, body, method) {
   const issue = repo.issues.get(number);
   if (rest.length === 1) {
     if (!issue) return jsonError(res, 404, 'Not Found');
-    if (method === 'GET') return sendJson(res, 200, issueRestObject(repo, issue));
+    if (method === 'GET') {
+      const cached = repo.issueJson.get(number);
+      if (cached) return sendCachedJson(res, 200, cached);
+      const body = Buffer.from(JSON.stringify(issueRestObject(repo, issue)), 'utf8');
+      repo.issueJson.set(number, body);
+      return sendCachedJson(res, 200, body);
+    }
     if (method === 'PATCH') {
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
@@ -1630,6 +1762,7 @@ function handleIssues(req, res, repo, rest, query, body, method) {
         for (const name of body.labels) if (!repo.labels.has(name)) return jsonError(res, 422, `unknown label ${name}`);
         issue.labels = [...body.labels];
       }
+      dropIssueJson(repo, number);
       return sendJson(res, 200, issueRestObject(repo, issue));
     }
     return jsonError(res, 404, 'Not Found');
@@ -1649,6 +1782,7 @@ function handleIssues(req, res, repo, rest, query, body, method) {
       if (typeof body.body !== 'string' || body.body === '') return jsonError(res, 422, 'body is required');
       const comment = { id: store.nextRestId++, body: body.body, seq: ++store.tsSeq };
       issue.comments.push(comment);
+      dropIssueJson(repo, number); // the issue's comment count changed
       return sendJson(res, 201, {
         id: comment.id,
         node_id: gid('IssueComment', `${repo.owner}/${repo.name}:${issue.number}:${comment.id}`),
@@ -2096,6 +2230,7 @@ function gqlResolve(parent, parentType, field, variables, errors) {
         const issue = repo?.issues.get(Number.parseInt(m[2], 10));
         if (!issue) { errors.push({ message: 'closeIssue: issue not found' }); return null; }
         issue.state = 'closed';
+        dropIssueJson(repo, issue.number);
         return { __type: 'CloseIssuePayload', issue: issueWrapper(repo, issue) };
       }
       if (field.name === 'createPullRequest') {
@@ -2135,6 +2270,7 @@ function gqlResolve(parent, parentType, field, variables, errors) {
         if (!issue) { errors.push({ message: 'addComment: issue not found' }); return null; }
         const comment = { id: store.nextRestId++, body: input.body ?? '', seq: ++store.tsSeq };
         issue.comments.push(comment);
+        dropIssueJson(repo, issue.number);
         return {
           __type: 'AddCommentPayload',
           commentEdge: {
@@ -2652,12 +2788,13 @@ async function handleMcp(req, res, rawBody) {
 
 async function handleRequest(req, res) {
   try {
-    const url = new URL(req.url, 'http://localhost');
+    const url = parseRequestUrl(req.url || '/');
     const pathname = url.pathname;
     const segments = pathname
       .split('/')
       .filter((s) => s !== '')
       .map((s) => {
+        if (!s.includes('%')) return s;
         try { return decodeURIComponent(s); } catch { return null; }
       });
     if (segments.includes(null)) return sendJson(res, 400, { message: 'bad path' });
@@ -2715,7 +2852,8 @@ async function handleRequest(req, res) {
 
     // REST v3
     if (segments.length >= 2 && segments[0] === 'api' && segments[1] === 'v3') {
-      const raw = await readBody(req);
+      // GET/HEAD never carry a body here: do not wait for the request's 'end'.
+      const raw = (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE') ? await readBody(req) : EMPTY_BODY;
       return await handleRest(req, res, segments.slice(2), url.searchParams, raw);
     }
 
