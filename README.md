@@ -1,12 +1,13 @@
-# github-core-clone
-
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![rank](https://make.fun/badge/github-core-clone-01/Chapo1245/github-core-clone-01-chapo124574/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/Chapo1245/github-core-clone-01-chapo124574/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A fast, in-memory GitHub core clone in a single Node.js process (stdlib only,
-no dependencies): git smart HTTP (protocol v2 + v0), REST v3, GraphQL v4 and
-MCP (Model Context Protocol, Streamable HTTP) over one shared in-memory store.
+# Iron Forge — a standalone GitHub-compatible git forge
+
+A single Node 22 process serving git smart HTTP (protocol v2 upload-pack /
+v0 receive-pack), the REST v3 API, GraphQL v4 and MCP from its own in-memory
+store. Standard library only: no dependencies, no git binary, no outside
+service, no UI.
 
 ## Run
 
@@ -14,41 +15,46 @@ MCP (Model Context Protocol, Streamable HTTP) over one shared in-memory store.
 node main.ts
 ```
 
-The server listens on an ephemeral port (`listen(0)`). When
-`MAKEFUN_ENV_URL` is set it registers its port with the environment and exits
-when the environment reports `done`. `MAKEFUN_SHOP_TOKEN` sets the bearer
-token accepted for authenticated endpoints; when unset, any non-empty token
-is accepted.
+The server binds an ephemeral port. With `MAKEFUN_ENV_URL` set (a make.fun
+trial) it registers the port with the suite and long-polls `/done`, exiting 0
+when the suite finishes. Without it, it serves until killed.
 
-## What it implements
+`FORGE_TRANSPORT=tcp` (default) uses a hand-rolled HTTP/1.1 server over
+`node:net` for the lowest per-request overhead; `FORGE_TRANSPORT=http` uses
+`node:http` instead. `MAKEFUN_SHOP_TOKEN` sets the bearer token the API
+requires; when unset, any non-empty bearer token is accepted (local runs).
 
-- **Git smart HTTP**: `GET /{owner}/{repo}.git/info/refs` (protocol v2
-  advertisement, `ls-refs` and `fetch` v2, v0 `upload-pack` with sideband,
-  `receive-pack` with per-ref `ok`/`ng` reporting, non-fast-forward refusal,
-  shallow fetch, annotated tags, pack reading/writing with delta resolution).
-- **REST v3** (`/api/v3/`): repos, branches, refs, commits, contents, labels,
-  issues, pull requests (incl. squash merge), pagination via `Link` headers.
-- **GraphQL** (`/api/graphql`): viewer, repository, node, introspection,
-  issue/pull-request connections with cursor pagination, and the
-  `createIssue` / `closeIssue` / `createPullRequest` / `mergePullRequest` /
-  `addComment` mutations. Global ids are opaque base64 values.
-- **MCP** (`/mcp`): `initialize`, `server/discover`, `tools/list`,
-  `tools/call` for `create_repo`, `get_repo`, `create_issue`,
-  `list_issues`, `create_pull_request`, `merge_pull_request`.
+## What it serves
 
-## Design notes
+- **Git smart HTTP** at `/{owner}/{repo}.git`: v2 capability advertisement,
+  `ls-refs` (peel / symrefs / unborn / ref-prefix), v2 and v0 fetch with
+  thin-pack, shallow/deepen, have/want negotiation and sideband packfiles,
+  and v0 receive-pack with fast-forward enforcement and per-ref
+  report-status. Packs are plain (no deltas); fetch responses are cached
+  per repository generation.
+- **REST v3** under `/api/v3`: repositories, branches, commits, contents
+  (create / update with stale-sha 409 / delete), labels, issues, comments,
+  pull requests and squash merge with conflict detection.
+- **GraphQL** at `/api/graphql`: repository / issue / pull-request queries,
+  introspection, cursor pagination, and the create/close-issue,
+  create/merge-pull-request and add-comment mutations, with opaque stable
+  global ids.
+- **MCP** at `/mcp`: Streamable HTTP, revision 2026-07-28 via
+  `server/discover` (legacy `initialize` handshake also answered), six
+  tools (`create_repo`, `get_repo`, `create_issue`, `list_issues`,
+  `create_pull_request`, `merge_pull_request`) acting on the same store
+  as REST.
 
-- Everything is in-memory (`Map`s); no wall clock or randomness in state, so
-  replaying the same request sequence yields the same state.
-- Git objects are real SHA-1 objects (blob/tree/commit/tag) with zlib pack
-  encoding; packs are written without deltas (the protocol does not require
-  them).
-- Timestamps are deterministic (an epoch counter), never `Date.now()` in
-  state.
-- Single file, stdlib only (`node:http`, `node:crypto`, `node:zlib`).
+## Performance
+
+Hot paths are built for the four timed workloads: pre-serialized issue
+responses, per-generation cached advertisements / ls-refs / fetch packs,
+single-call zlib inflate per pack object, and minimal per-request
+allocation in the transport. See the repository history for measured
+local numbers.
 
 ## License
 
-MIT
+MIT. See `LICENSE`.
 
 <sub>Entered on [make.fun](https://make.fun/?ref=wtacm6ft&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
